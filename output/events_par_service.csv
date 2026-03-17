@@ -1,0 +1,6 @@
+Service,Nombre_Events
+apache2_access.log,27796
+syslog,20833
+kern.log,10060
+auth.log,2611
+journald,254
