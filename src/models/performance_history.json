@@ -1,0 +1,12 @@
+[
+  {
+    "session": 35,
+    "timestamp": "2026-03-23T12:13:57.743644",
+    "nb_echantillons": 3,
+    "taux_anomalies": 0.0,
+    "score_moyen": 0.141,
+    "score_max": 0.1671,
+    "nb_blacklistes": 0,
+    "silhouette": null
+  }
+]

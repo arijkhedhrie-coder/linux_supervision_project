@@ -1,0 +1,47 @@
+{
+  "timestamp": "2026-03-23T13:14:40.779266",
+  "environnement": "LOCAL",
+  "nb_fichiers": 4,
+  "nb_ok": 4,
+  "nb_echec": 0,
+  "taille_totale_ko": 23250.1,
+  "duree_totale_s": 3633.92,
+  "details": [
+    {
+      "fichier": "processed/events_par_service.csv",
+      "statut": "OK",
+      "taille_ko": 0.1,
+      "duree_s": 2.972,
+      "debit_mbs": 0.0,
+      "md5_ok": true,
+      "version": "processed/historique/events_par_service_2026-03-23_12-14-09.csv"
+    },
+    {
+      "fichier": "processed/erreurs_par_heure.csv",
+      "statut": "OK",
+      "taille_ko": 0.1,
+      "duree_s": 2.985,
+      "debit_mbs": 0.0,
+      "md5_ok": true,
+      "version": "processed/historique/erreurs_par_heure_2026-03-23_12-14-10.csv"
+    },
+    {
+      "fichier": "processed/tentatives_par_ip.csv",
+      "statut": "OK",
+      "taille_ko": 0.1,
+      "duree_s": 2.985,
+      "debit_mbs": 0.0,
+      "md5_ok": true,
+      "version": "processed/historique/tentatives_par_ip_2026-03-23_12-14-10.csv"
+    },
+    {
+      "fichier": "processed/logs_clean.csv",
+      "statut": "OK",
+      "taille_ko": 23249.8,
+      "duree_s": 73.189,
+      "debit_mbs": 0.31,
+      "md5_ok": false,
+      "version": "processed/historique/logs_clean_2026-03-23_13-14-40.csv"
+    }
+  ]
+}

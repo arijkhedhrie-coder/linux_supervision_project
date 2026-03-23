@@ -1,23 +1,14 @@
 """
-agents.py
-Architecture multi-agents CrewAI — 6 agents spécialisés :
-  1. Collecteur       — Récupère les logs depuis S3
-  2. Analyste         — Analyse les patterns et prédit les tendances
-  3. Détecteur        — Détecte anomalies + déclenche alarmes préventives
-  4. Correcteur       — Propose et exécute des actions correctives automatiques
-  5. Orchestrateur    — Coordonne les agents et gère les priorités
-  6. Rapporteur       — Génère et sauvegarde le rapport final sur S3
+agents.py — CORRECTIONS APPLIQUÉES
+====================================
+FIX 1 — MCP Timeout 30s :
+    OutilListerLogs et OutilLireLogs appellent s3_tools DIRECTEMENT
+    au lieu de passer par le subprocess MCP.
+    → Plus de timeout, réponse immédiate.
 
-FIXES APPLIQUÉS :
-  - [FIX 1] OutilDeclencherAlarme : indentation corrigée, code mort supprimé,
-            contenu + nom_fichier ajoutés pour le MCP
-  - [FIX 2] OutilActionCorrective : parsing texte libre (BRUTE-FORCE SSH détecté
-            même sans JSON), contenu + nom_fichier ajoutés pour le MCP
-  - [FIX 3] OutilSauvegarderRapport : nom_fichier ajouté pour le MCP
-  - [FIX 4] OutilOrchestration : garantit toujours un str (jamais None)
-  - [FIX 5] orchestrator_agent : tools=[] pour éviter brave_search sur Groq
-  - [FIX 6] NOUVEAU — OutilActionCorrective appelle RÉELLEMENT boto3
-            bloquer_ip_secgroup() pour un blocage AWS réel
+FIX 3 — SURVEILLANCE_NORMALE non reconnue :
+    OutilActionCorrective._run() gère maintenant explicitement
+    "SURVEILLANCE_NORMALE" et "MONITORING" avant le fallback INSPECTION_MANUELLE.
 """
 
 import os
@@ -35,7 +26,6 @@ os.environ["CREWAI_EMBEDDING_MODEL"]    = "nomic-embed-text"
 os.environ["OLLAMA_BASE_URL"]           = "http://localhost:11434"
 os.environ["OTEL_SDK_DISABLED"]         = "true"
 
-# Patch RAGStorage pour forcer Ollama avant initialisation ChromaDB
 try:
     from crewai.memory.storage.rag_storage import RAGStorage
     _original_init = RAGStorage.__init__
@@ -67,10 +57,23 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY or ""
 
 # ================================
-# [FIX 6] IMPORT AWS SECURITY — BLOCAGE BOTO3 RÉEL
-# Import optionnel : si aws_security.py n'est pas disponible,
-# l'agent continue en mode simulation sans planter.
+# [FIX 1] IMPORT DIRECT s3_tools
+# Contourne le MCP subprocess → plus de timeout 30s
 # ================================
+try:
+    project_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    from src.tools import s3_tools as _s3_tools
+    S3_DIRECT_DISPONIBLE = True
+    print("[OK] s3_tools chargé directement — bypass MCP activé")
+except Exception as _e:
+    _s3_tools = None
+    S3_DIRECT_DISPONIBLE = False
+    print(f"[WARN] s3_tools direct indisponible ({_e}) — fallback MCP")
+
 try:
     from src.aws_security import bloquer_ip_secgroup, bloquer_depuis_anomalie
     AWS_SECURITY_DISPONIBLE = True
@@ -81,23 +84,21 @@ except ImportError:
 
 
 # ================================
-# LLM — Groq avec rate limit géré
+# LLM — Groq
 # ================================
 llm = LLM(
     model="groq/llama-3.1-8b-instant",
     api_key=GROQ_API_KEY,
     temperature=0.0,
-    max_tokens=500,    # Limite la réponse → économise les tokens Groq
-    max_retries=5,     # Réessaie automatiquement si rate limit
+    max_tokens=500,
+    max_retries=5,
     timeout=60,
 )
 
-# Délai entre chaque appel LLM pour ne pas dépasser 6000 tokens/minute
 _last_llm_call = [0.0]
-_MIN_DELAY_SECONDS = 20  # 60s / 5 appels max = 20s minimum entre chaque appel
+_MIN_DELAY_SECONDS = 20
 
 def _throttle():
-    """Attend si nécessaire pour respecter la limite Groq (6000 TPM)."""
     elapsed = time.time() - _last_llm_call[0]
     if elapsed < _MIN_DELAY_SECONDS:
         wait = _MIN_DELAY_SECONDS - elapsed
@@ -107,12 +108,12 @@ def _throttle():
 
 
 # ================================
-# FONCTION HELPER MCP
+# FONCTION HELPER MCP (conservée pour les autres outils)
 # ================================
 def _appeler_mcp(nom_outil: str, arguments: dict) -> str:
     """
     Appelle le serveur MCP en stdin/stdout (subprocess).
-    Retourne toujours une str — jamais None.
+    Utilisé uniquement pour les outils qui n'ont pas d'équivalent direct.
     """
     messages = [
         {
@@ -141,10 +142,10 @@ def _appeler_mcp(nom_outil: str, arguments: dict) -> str:
     input_data = "\n".join(json.dumps(m) for m in messages)
 
     try:
-        project_root = os.path.dirname(
+        _root = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
-        mcp_path = os.path.join(project_root, "src", "mcp", "mcp_server.py")
+        mcp_path = os.path.join(_root, "src", "mcp", "mcp_server.py")
         env      = os.environ.copy()
 
         result = subprocess.run(
@@ -153,7 +154,7 @@ def _appeler_mcp(nom_outil: str, arguments: dict) -> str:
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=project_root,
+            cwd=_root,
             env=env
         )
 
@@ -198,31 +199,19 @@ class AnalyserLogsInput(BaseModel):
     contenu: Optional[str] = Field(default=None, description="Contenu des logs à analyser")
 
 class DetecterAnomaliesInput(BaseModel):
-    rapport: Optional[str] = Field(default=None, description="Rapport ou logs à analyser pour détecter les anomalies")
+    rapport: Optional[str] = Field(default=None, description="Rapport ou logs à analyser")
 
 class AlarmeInput(BaseModel):
-    alarmes_json: Optional[str] = Field(
-        default=None,
-        description="Liste JSON des alarmes déclenchées par le détecteur"
-    )
+    alarmes_json: Optional[str] = Field(default=None, description="Liste JSON des alarmes")
 
 class ActionCorrectiveInput(BaseModel):
-    anomalie_json: Optional[str] = Field(
-        default=None,
-        description="Anomalie détectée en JSON avec type, IP, sévérité et message d'alarme"
-    )
+    anomalie_json: Optional[str] = Field(default=None, description="Anomalie en JSON")
 
 class OrchestrationInput(BaseModel):
-    contexte: Optional[str] = Field(
-        default=None,
-        description="Contexte global de la session d'analyse pour coordonner les agents"
-    )
+    contexte: Optional[str] = Field(default=None, description="Contexte global de la session")
 
 class SauvegarderRapportInput(BaseModel):
-    rapport_json: Optional[str] = Field(
-        default=None,
-        description="Le rapport COMPLET sérialisé en une seule string JSON"
-    )
+    rapport_json: Optional[str] = Field(default=None, description="Rapport complet en JSON string")
 
 
 # ================================
@@ -237,8 +226,18 @@ class OutilListerLogs(BaseTool):
     )
     args_schema: type[BaseModel] = ListerLogsInput
 
+    # ── [FIX 1] Appel direct s3_tools — bypass MCP subprocess ──
     def _run(self, prefix: Optional[str] = None, **kwargs) -> str:
         prefix = "processed/"
+
+        if S3_DIRECT_DISPONIBLE:
+            try:
+                fichiers = _s3_tools.list_objects(prefix=prefix)
+                return "Fichiers disponibles dans S3:\n" + "\n".join(fichiers)
+            except Exception as e:
+                print(f"[WARN] s3_tools.list_objects échoué ({e}) — fallback MCP")
+
+        # Fallback MCP si s3_tools indisponible
         return _appeler_mcp("lister_logs_s3", {"prefix": prefix})
 
 
@@ -250,11 +249,28 @@ class OutilLireLogs(BaseTool):
     )
     args_schema: type[BaseModel] = LireLogsInput
 
+    # ── [FIX 1] Appel direct s3_tools — bypass MCP subprocess ──
     def _run(self, fichier: Optional[str] = None, **kwargs) -> str:
         if fichier and fichier.startswith("logs/"):
             fichier = fichier.replace("logs/", "", 1)
+
+        if S3_DIRECT_DISPONIBLE:
+            try:
+                contenu = _s3_tools.read_object(fichier)
+                try:
+                    contenu = contenu.encode("latin-1").decode("utf-8")
+                except Exception:
+                    pass
+                lignes = contenu.split("\n")[:12]
+                texte  = "\n".join(lignes)
+                if len(contenu.split("\n")) > 12:
+                    texte += "\n... [tronqué à 12 lignes]"
+                return f"Logs recuperes depuis S3:\n{texte}"
+            except Exception as e:
+                print(f"[WARN] s3_tools.read_object échoué ({e}) — fallback MCP")
+
+        # Fallback MCP
         resultat = _appeler_mcp("lire_logs_s3", {"fichier": fichier})
-        # Correction encodage latin-1 → utf-8
         try:
             resultat = resultat.encode("latin-1").decode("utf-8")
         except Exception:
@@ -268,22 +284,58 @@ class OutilLireLogs(BaseTool):
 class OutilAnalyserLogs(BaseTool):
     name: str = "analyser_logs"
     description: str = (
-        "Analyse les logs pour compter erreurs, warnings, connexions SSH "
-        "et prédit les tendances."
+        "Analyse les logs et compte tous les types d'attaques et événements suspects."
     )
     args_schema: type[BaseModel] = AnalyserLogsInput
 
     def _run(self, contenu: Optional[str] = None, **kwargs) -> str:
-        return _appeler_mcp("analyser_logs", {"contenu_logs": contenu or str(kwargs)})
+        if not contenu:
+            return "Aucun contenu à analyser"
+
+        lignes = contenu.splitlines()
+        compteurs = {
+            "SSH_BRUTE_FORCE":  0,
+            "PORT_SCAN":        0,
+            "WEB_ENUMERATION":  0,
+            "FIREWALL_BLOCK":   0,
+            "AUTH_FAILURE":     0,
+            "SUDO_ABUSE":       0,
+            "MEMORY_CRITICAL":  0,
+            "SERVICE_FAILED":   0,
+        }
+
+        for ligne in lignes:
+            l = ligne.upper()
+            if "FAILED PASSWORD" in l or "INVALID USER" in l or "BRUTE" in l:
+                compteurs["SSH_BRUTE_FORCE"] += 1
+            if "NMAP" in l or "PORT SCAN" in l or "MASSCAN" in l:
+                compteurs["PORT_SCAN"] += 1
+            if "GOBUSTER" in l or "ENUMERATION" in l or "DIRB" in l:
+                compteurs["WEB_ENUMERATION"] += 1
+            if "UFW BLOCK" in l or "IPTABLES" in l or "DENIED" in l:
+                compteurs["FIREWALL_BLOCK"] += 1
+            if "AUTHENTICATION FAILURE" in l or "PERM DENIED" in l:
+                compteurs["AUTH_FAILURE"] += 1
+            if "SUDO" in l and "COMMAND" in l:
+                compteurs["SUDO_ABUSE"] += 1
+            if "OUT OF MEMORY" in l or "OOM" in l:
+                compteurs["MEMORY_CRITICAL"] += 1
+            if "FAILED" in l and "SERVICE" in l:
+                compteurs["SERVICE_FAILED"] += 1
+
+        rapport = "=== RAPPORT D'ANALYSE ===\n"
+        for type_attaque, nombre in compteurs.items():
+            if nombre > 0:
+                rapport += f"{type_attaque}: {nombre} occurrence(s)\n"
+
+        total = sum(compteurs.values())
+        rapport += f"\nTOTAL ÉVÉNEMENTS SUSPECTS : {total}"
+        return rapport
 
 
 class OutilDetecterAnomalies(BaseTool):
     name: str = "detecter_anomalies"
-    description: str = (
-        "Détecte les intrusions SSH, surcharges système et comportements suspects. "
-        "Déclenche automatiquement une alarme préventive avec un message adapté "
-        "au type d'anomalie AVANT que la panne survienne."
-    )
+    description: str = "Détecte les intrusions SSH, surcharges système et comportements suspects."
     args_schema: type[BaseModel] = DetecterAnomaliesInput
 
     def _run(self, rapport: Optional[str] = None, **kwargs) -> str:
@@ -294,22 +346,35 @@ class OutilDeclencherAlarme(BaseTool):
     name: str = "declencher_alarme"
     description: str = (
         "Déclenche une alarme préventive AVANT qu'une panne survienne. "
-        "Génère un message d'alerte compatible avec le type d'anomalie détectée : "
-        "brute-force SSH, surcharge CPU/RAM, port scan, comportement suspect. "
-        "Envoie une notification et stocke l'alarme dans S3."
+        "Si alarmes_json vaut 'Aucune alarme critique' ou est vide, "
+        "NE PAS déclencher d'alarme — retourner un statut OK."
     )
     args_schema: type[BaseModel] = AlarmeInput
 
     def _run(self, alarmes_json: Optional[str] = None, **kwargs) -> str:
+        # ── [FIX 2 côté outil] Garde-fou : aucune alarme = pas de déclenchement ──
+        if not alarmes_json or alarmes_json.strip() in (
+            "Aucune alarme critique", "[]", "", "null", "aucune", "none"
+        ):
+            return "✅ Aucune alarme à déclencher — système en état normal."
+
         try:
-            alarmes = json.loads(alarmes_json) if alarmes_json else []
+            alarmes = json.loads(alarmes_json)
             if not isinstance(alarmes, list):
                 alarmes = [alarmes]
+            # Liste vide après parsing
+            if not alarmes:
+                return "✅ Aucune alarme à déclencher — liste vide."
         except Exception:
+            # Texte libre — seulement si ça ressemble vraiment à une anomalie
+            texte_upper = alarmes_json.upper()
+            mots_cles_reels = ["BRUTE", "SCAN", "INTRUSION", "CRITIQUE", "BLOCAGE"]
+            if not any(m in texte_upper for m in mots_cles_reels):
+                return "✅ Pas d'anomalie confirmée dans le message reçu."
             alarmes = [{
-                "type":     "BRUTE-FORCE SSH",
-                "message":  alarmes_json or "Anomalie détectée",
-                "severite": "CRITIQUE",
+                "type":     "ANOMALIE",
+                "message":  alarmes_json,
+                "severite": "AVERTISSEMENT",
                 "ip":       "multiple"
             }]
 
@@ -323,27 +388,19 @@ class OutilDeclencherAlarme(BaseTool):
             if "BRUTE-FORCE" in type_alarme or "SSH" in type_alarme:
                 notification = (
                     f"🔴 ALARME SÉCURITÉ — BRUTE-FORCE SSH DÉTECTÉ\n"
-                    f"IP Source: {ip}\n"
-                    f"Détail: {message}\n"
+                    f"IP Source: {ip}\nDétail: {message}\n"
                     f"Action immédiate requise: Bloquer {ip} via iptables/Fail2Ban"
                 )
             elif "SURCHARGE" in type_alarme or "CPU" in type_alarme:
                 notification = (
                     f"🟠 ALARME PERFORMANCE — SURCHARGE SYSTÈME DÉTECTÉE\n"
                     f"Détail: {message}\n"
-                    f"Action immédiate requise: Vérifier les processus et libérer les ressources"
-                )
-            elif "MÉMOIRE" in type_alarme or "RAM" in type_alarme:
-                notification = (
-                    f"🟡 ALARME RESSOURCES — SATURATION MÉMOIRE DÉTECTÉE\n"
-                    f"Détail: {message}\n"
-                    f"Action immédiate requise: Libérer la RAM ou redémarrer les services non critiques"
+                    f"Action immédiate requise: Vérifier les processus"
                 )
             elif "SCAN" in type_alarme or "PORT" in type_alarme:
                 notification = (
                     f"🔵 ALARME RECONNAISSANCE — SCAN DE PORTS DÉTECTÉ\n"
-                    f"IP Source: {ip}\n"
-                    f"Détail: {message}\n"
+                    f"IP Source: {ip}\nDétail: {message}\n"
                     f"Action immédiate requise: Ajouter {ip} à la blacklist"
                 )
             else:
@@ -358,74 +415,91 @@ class OutilDeclencherAlarme(BaseTool):
             print(f"{'='*60}\n")
 
             ip_safe = str(ip).replace(".", "_").replace("/", "_")
-            result = _appeler_mcp("sauvegarder_rapport_s3", {
+            result  = _appeler_mcp("sauvegarder_rapport_s3", {
                 "contenu":     notification,
                 "nom_fichier": f"alarme_{ip_safe}.json",
                 "type":        "alarme",
             })
             resultats.append(f"Alarme envoyée: {notification[:100]}... | S3: {result}")
 
-        return "\n".join(resultats) if resultats else "Aucune alarme à déclencher"
+        return "\n".join(resultats) if resultats else "✅ Aucune alarme déclenchée."
 
 
 class OutilActionCorrective(BaseTool):
     name: str = "appliquer_action_corrective"
     description: str = (
-        "Applique automatiquement une action corrective selon le type d'anomalie : "
-        "- Blocage IP réel dans AWS Security Group via Boto3 pour brute-force SSH "
-        "- Bannissement IP via Fail2Ban pour échecs d'authentification "
-        "- Blacklist IP pour port scan Nmap "
-        "- Désactivation de compte utilisateur suspect "
-        "- Alerte email/Slack pour surcharge système"
+        "Applique automatiquement l'action corrective selon le type d'anomalie. "
+        "Gère aussi le mode SURVEILLANCE_NORMALE sans déclencher de blocage."
     )
     args_schema: type[BaseModel] = ActionCorrectiveInput
 
     def _run(self, anomalie_json: Optional[str] = None, **kwargs) -> str:
-        # ── Parsing de l'anomalie (JSON ou texte libre) ───────────────────────
+        # ── Parsing JSON ou texte libre ───────────────────────────────────────
         try:
             anomalie = json.loads(anomalie_json) if anomalie_json else {}
         except Exception:
-            texte = (anomalie_json or "")
+            texte       = (anomalie_json or "")
             texte_upper = texte.upper()
-            # Extraire l'IP du texte libre (ex: "BLOCAGE IP 150.183.249.110 brute-force")
             import re
             ip_trouvee = "multiple"
             match = re.search(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', texte)
             if match:
                 ip_trouvee = match.group(1)
             if "BRUTE" in texte_upper or "SSH" in texte_upper or "BLOCAGE" in texte_upper:
-                anomalie = {
-                    "type":     "BRUTE-FORCE SSH",
-                    "severite": "CRITIQUE",
-                    "ip":       ip_trouvee
-                }
-            elif "CPU" in texte or "SURCHARGE" in texte:
-                anomalie = {
-                    "type":     "SURCHARGE CPU",
-                    "severite": "AVERTISSEMENT",
-                    "ip":       "N/A"
-                }
-            elif "SCAN" in texte or "PORT" in texte:
-                anomalie = {
-                    "type":     "PORT SCAN",
-                    "severite": "AVERTISSEMENT",
-                    "ip":       "N/A"
-                }
+                anomalie = {"type": "BRUTE-FORCE SSH", "severite": "CRITIQUE", "ip": ip_trouvee}
+            elif "CPU" in texte_upper or "SURCHARGE" in texte_upper:
+                anomalie = {"type": "SURCHARGE CPU", "severite": "AVERTISSEMENT", "ip": "N/A"}
+            elif "SCAN" in texte_upper or "PORT" in texte_upper:
+                anomalie = {"type": "PORT SCAN", "severite": "AVERTISSEMENT", "ip": "N/A"}
             else:
                 anomalie = {"description": str(anomalie_json)}
 
         type_anomalie = anomalie.get("type", anomalie.get("feature", ""))
         ip            = anomalie.get("ip", "N/A")
         severite      = anomalie.get("severite", "AVERTISSEMENT")
+        action_req    = anomalie.get("action", "")
 
-        # ── Construction de l'action corrective simulée ───────────────────────
-        if "BRUTE" in type_anomalie.upper() or "SSH" in type_anomalie.upper() or "tentatives" in type_anomalie:
+        type_upper   = type_anomalie.upper()
+        action_upper = action_req.upper()
+
+        # ── [FIX 3] SURVEILLANCE_NORMALE — cas explicite ─────────────────────
+        if (
+            "SURVEILLANCE" in type_upper
+            or "NORMALE" in type_upper
+            or "MONITORING" in action_upper
+            or type_upper in ("", "FAIBLE", "INFO")
+            and severite in ("FAIBLE", "INFO", "NORMAL")
+        ):
+            action = {
+                "type":        "SURVEILLANCE_NORMALE",
+                "description": "✅ Système en surveillance normale — aucune action corrective requise.",
+                "statut":      "OK",
+                "details":     {
+                    "ip":       ip,
+                    "severite": severite,
+                    "message":  "Aucune attaque active confirmée. Monitoring passif actif.",
+                    "conseil":  (
+                        "Continuer la surveillance. "
+                        "Prochain cycle d'analyse prévu automatiquement."
+                    )
+                }
+            }
+            print(f"[ACTION CORRECTIVE] {action['description']}")
+            result_str = json.dumps(action, ensure_ascii=False, indent=2)
+            _appeler_mcp("sauvegarder_rapport_s3", {
+                "contenu":     result_str,
+                "nom_fichier": "action_surveillance-normale.json",
+                "type":        "action_corrective",
+            })
+            return result_str
+
+        # ── Cas réels ─────────────────────────────────────────────────────────
+        if "BRUTE" in type_upper or "SSH" in type_upper or "tentatives" in type_anomalie:
             if severite == "CRITIQUE":
                 action = {
                     "type":        "BLOCAGE_IP_AWS_SECGROUP",
                     "commande":    f"iptables -A INPUT -s {ip} -j DROP",
                     "description": f"🔒 Blocage immédiat de {ip} via AWS Security Group (Boto3)",
-                    "aws_action":  f"Suppression règle ALLOW + Tag audit dans Security Group AWS",
                     "statut":      "EN_COURS"
                 }
             else:
@@ -436,44 +510,43 @@ class OutilActionCorrective(BaseTool):
                     "statut":      "EXÉCUTÉ"
                 }
 
-        elif "SCAN" in type_anomalie.upper() or "PORT" in type_anomalie.upper():
+        elif "SCAN" in type_upper or "PORT" in type_upper:
             action = {
                 "type":        "BLACKLIST_IP",
-                "commande":    f"iptables -A INPUT -s {ip} -j DROP && echo '{ip}' >> /etc/blacklist.txt",
+                "commande":    f"iptables -A INPUT -s {ip} -j DROP",
                 "description": f"🚫 Ajout de {ip} à la blacklist (scan de ports détecté)",
                 "statut":      "EXÉCUTÉ"
             }
 
-        elif "SURCHARGE" in type_anomalie.upper() or "CPU" in type_anomalie.upper() or "erreurs" in type_anomalie:
+        elif "SURCHARGE" in type_upper or "CPU" in type_upper or "erreurs" in type_anomalie:
             action = {
                 "type":        "ALERTE_SYSTEME",
                 "commande":    "systemctl status --failed && journalctl -p err -n 50",
                 "description": "📧 Alerte email envoyée + logs critiques archivés dans S3",
-                "slack_msg":   "⚠️ Surcharge système détectée — vérification requise immédiatement",
                 "statut":      "ALERTE_ENVOYÉE"
             }
 
-        elif "MÉMOIRE" in type_anomalie.upper() or "mem" in type_anomalie:
+        elif "MÉMOIRE" in type_upper or "MEM" in type_upper:
             action = {
                 "type":        "LIBERER_MEMOIRE",
                 "commande":    "sync && echo 3 > /proc/sys/vm/drop_caches",
-                "description": "🧹 Libération du cache mémoire + redémarrage des services non critiques",
+                "description": "🧹 Libération du cache mémoire",
                 "statut":      "EXÉCUTÉ"
             }
 
-        elif "UTILISATEUR" in type_anomalie.upper() or "user" in type_anomalie:
+        elif "UTILISATEUR" in type_upper or "USER" in type_upper:
             user = anomalie.get("user", "unknown")
             action = {
                 "type":        "DESACTIVER_COMPTE",
                 "commande":    f"usermod -L {user}",
-                "description": f"🔐 Compte {user} temporairement désactivé (comportement suspect)",
+                "description": f"🔐 Compte {user} désactivé (comportement suspect)",
                 "statut":      "EXÉCUTÉ"
             }
 
         else:
             action = {
                 "type":        "INSPECTION_MANUELLE",
-                "description": f"⚠️ Anomalie inconnue — inspection manuelle requise pour: {anomalie}",
+                "description": f"⚠️ Anomalie non reconnue — inspection requise : {anomalie}",
                 "statut":      "EN_ATTENTE"
             }
 
@@ -481,63 +554,32 @@ class OutilActionCorrective(BaseTool):
         if "commande" in action:
             print(f"[COMMANDE]          {action['commande']}")
 
-        # ── [FIX 6] BLOCAGE AWS RÉEL via Boto3 ───────────────────────────────
-        # Déclenché uniquement pour SSH/BRUTE-FORCE avec une IP spécifique
-        est_ssh      = "BRUTE" in type_anomalie.upper() or "SSH" in type_anomalie.upper()
+        # ── Blocage AWS réel ──────────────────────────────────────────────────
+        est_ssh       = "BRUTE" in type_upper or "SSH" in type_upper
         ip_specifique = ip and ip not in ("N/A", "multiple", "")
 
         if AWS_SECURITY_DISPONIBLE and est_ssh and ip_specifique and severite == "CRITIQUE":
-            print(f"\n[AWS BOTO3] ⚡ Déclenchement blocage RÉEL de {ip} dans Security Group AWS...")
+            print(f"\n[AWS BOTO3] ⚡ Blocage RÉEL de {ip}...")
             try:
                 aws_result = bloquer_ip_secgroup(
                     ip=ip,
-                    raison=(
-                        f"Agent IA CrewAI | {type_anomalie} | "
-                        f"Sévérité: {severite} | Auto-blocage"
-                    )
+                    raison=f"Agent IA CrewAI | {type_anomalie} | {severite} | Auto-blocage"
                 )
                 action["aws_blocage_reel"] = aws_result
-                action["aws_statut"]       = aws_result.get("statut", "INCONNU")
                 action["statut"]           = "EXÉCUTÉ"
-
-                # Log du résultat AWS
-                msg_aws = aws_result.get("message", "N/A")
-                print(f"[AWS BOTO3] Résultat  : {msg_aws}")
-                print(f"[AWS BOTO3] SG statut : {aws_result.get('statut')}")
-                if aws_result.get("regles_supprimees"):
-                    print(f"[AWS BOTO3] Règles supprimées : {aws_result['regles_supprimees']}")
-                if aws_result.get("tag_audit"):
-                    print(f"[AWS BOTO3] Audit trail : {aws_result['tag_audit']}")
-                if aws_result.get("nacl_regle", {}).get("statut") == "DENY_AJOUTÉ":
-                    nacl_info = aws_result["nacl_regle"]
-                    print(f"[AWS BOTO3] NACL DENY #{nacl_info['rule_number']} ajoutée dans {nacl_info['nacl_id']}")
-
+                print(f"[AWS BOTO3] Résultat : {aws_result.get('message', 'N/A')}")
             except Exception as e:
-                print(f"[AWS BOTO3] ❌ Erreur boto3: {type(e).__name__}: {e}")
+                print(f"[AWS BOTO3] ❌ {type(e).__name__}: {e}")
                 action["aws_blocage_reel"] = {"statut": "ERREUR", "message": str(e)}
                 action["statut"]           = "ERREUR_AWS"
 
         elif AWS_SECURITY_DISPONIBLE and est_ssh and not ip_specifique:
-            # IP non spécifique (multiple) → log sans bloquer
-            print(f"[AWS BOTO3] ℹ️  IP '{ip}' non spécifique — blocage manuel requis")
             action["aws_blocage_reel"] = {
                 "statut":  "IGNORÉ",
-                "raison":  f"IP '{ip}' non spécifique — impossible de bloquer automatiquement",
-                "conseil": "Identifiez les IPs précises et appelez bloquer_ip_secgroup() manuellement"
+                "raison":  f"IP '{ip}' non spécifique — blocage manuel requis",
             }
 
-        elif not AWS_SECURITY_DISPONIBLE:
-            # Module non disponible → mode simulation
-            print("[AWS BOTO3] ⚠️  Mode simulation — aws_security.py non disponible")
-            action["aws_blocage_reel"] = {
-                "statut":  "SIMULATION",
-                "message": "aws_security.py non importé — configurez AWS_SECURITY_GROUP_ID dans .env"
-            }
-
-        # ── Sérialisation finale ──────────────────────────────────────────────
-        result_str = json.dumps(action, ensure_ascii=False, indent=2)
-
-        # Sauvegarde S3 via MCP
+        result_str  = json.dumps(action, ensure_ascii=False, indent=2)
         nom_fichier = f"action_{action['type'].lower().replace('_', '-')}.json"
         _appeler_mcp("sauvegarder_rapport_s3", {
             "contenu":     json.dumps(action, ensure_ascii=False),
@@ -560,10 +602,7 @@ class OutilOrchestration(BaseTool):
 
 class OutilSauvegarderRapport(BaseTool):
     name: str = "sauvegarder_rapport_s3"
-    description: str = (
-        "Sauvegarde le rapport final complet sur S3. "
-        "Sérialise TOUT le rapport en JSON string et le passe dans rapport_json."
-    )
+    description: str = "Sauvegarde le rapport final complet sur S3."
     args_schema: type[BaseModel] = SauvegarderRapportInput
 
     def _run(self, rapport_json: Optional[str] = None, **kwargs) -> str:
@@ -577,10 +616,7 @@ class OutilSauvegarderRapport(BaseTool):
 
         return _appeler_mcp(
             "sauvegarder_rapport_s3",
-            data or {
-                "contenu":     str(kwargs),
-                "nom_fichier": "rapport_final.json"
-            }
+            data or {"contenu": str(kwargs), "nom_fichier": "rapport_final.json"}
         )
 
 
@@ -601,121 +637,94 @@ outil_rapport      = OutilSauvegarderRapport()
 # 6 AGENTS SPÉCIALISÉS
 # ================================
 
-# ── Agent 1 : Collecteur ─────────────────────────────────────────────────────
 collector_agent = Agent(
     role="Collecteur de Logs",
     goal=(
-        "Collecter de manière exhaustive tous les fichiers logs depuis Amazon S3 "
+        "Collecter tous les fichiers logs depuis Amazon S3 "
         "et assurer la disponibilité des données pour les agents suivants."
     ),
     backstory=(
         "Tu es un expert en collecte de données système. Tu maîtrises parfaitement "
-        "Amazon S3 et récupères les logs des serveurs Linux (syslog, auth.log) "
-        "ainsi que les logs d'attaques générés par la VM Kali Linux."
+        "Amazon S3 et récupères les logs des serveurs Linux."
     ),
     tools=[outil_lister_logs, outil_lire_logs],
     llm=llm,
     verbose=True
 )
 
-# ── Agent 2 : Analyste ───────────────────────────────────────────────────────
 analyst_agent = Agent(
     role="Analyste de Logs Linux",
     goal=(
-        "Analyser en profondeur les logs pour identifier les patterns critiques, "
-        "compter les erreurs et connexions SSH, et prédire les tendances futures."
+        "Analyser en profondeur les logs pour identifier tous les types "
+        "d'attaques et événements suspects."
     ),
     backstory=(
         "Tu es un expert en analyse de logs Linux et en cybersécurité. "
-        "Tu distingues les erreurs critiques des simples warnings, "
-        "identifies les patterns suspects et anticipes les tendances "
-        "grâce à une analyse statistique rigoureuse."
+        "Tu distingues les erreurs critiques des simples warnings."
     ),
     tools=[outil_analyser],
     llm=llm,
     verbose=True
 )
 
-# ── Agent 3 : Détecteur + Alarmes ────────────────────────────────────────────
 detector_agent = Agent(
     role="Détecteur d'Anomalies et Déclencheur d'Alarmes",
     goal=(
-        "Détecter les anomalies et les comportements suspects, "
-        "puis déclencher automatiquement une alarme préventive AVANT que la panne survienne, "
-        "avec un message précis et adapté au type d'anomalie détectée."
+        "Détecter les anomalies confirmées et déclencher une alarme UNIQUEMENT "
+        "si une vraie menace est présente. Ne pas déclencher d'alarme si le "
+        "système est en état normal."
     ),
     backstory=(
         "Tu es un expert en cybersécurité et détection d'anomalies. "
-        "Tu identifies en temps réel les tentatives d'intrusion SSH, "
-        "les surcharges système, les scans de ports et les comportements anormaux. "
-        "Dès qu'une anomalie est confirmée ou qu'un seuil critique est dépassé, "
-        "tu déclenches immédiatement une alarme avec un message compatible "
-        "avec le type de menace pour alerter les équipes avant l'incident."
+        "Tu déclenches des alarmes SEULEMENT quand une anomalie réelle est confirmée. "
+        "Si nb_anomalies=0 et aucune alarme critique, tu retournes un statut OK "
+        "sans déclencher d'alarme."
     ),
     tools=[outil_anomalies, outil_alarme],
     llm=llm,
     verbose=True
 )
 
-# ── Agent 4 : Correcteur ─────────────────────────────────────────────────────
 corrector_agent = Agent(
     role="Agent Correcteur Automatique",
     goal=(
-        "Analyser chaque anomalie détectée et appliquer automatiquement "
-        "l'action corrective appropriée : blocage IP réel dans AWS Security Group, "
-        "ban Fail2Ban, blacklist, désactivation de compte ou alerte système."
+        "Appliquer l'action corrective appropriée selon l'anomalie reçue. "
+        "En mode surveillance normale, confirmer l'état OK sans bloquer d'IP."
     ),
     backstory=(
-        "Tu es un expert en remédiation automatique de sécurité informatique. "
-        "Pour chaque anomalie reçue du détecteur, tu choisis et exécutes "
-        "l'action corrective la plus adaptée : "
-        "blocage RÉEL via Boto3 dans l'AWS Security Group pour les brute-force SSH critiques, "
-        "Fail2Ban pour les échecs d'authentification répétés, "
-        "blacklist pour les scans de ports Nmap, "
-        "désactivation de compte pour les comportements suspects, "
-        "et alertes email/Slack pour les surcharges système."
+        "Tu es un expert en remédiation automatique. "
+        "Pour SURVEILLANCE_NORMALE tu confirmes simplement l'état sain. "
+        "Pour les vraies attaques tu bloques via AWS/iptables/Fail2Ban."
     ),
     tools=[outil_correctif],
     llm=llm,
     verbose=True
 )
 
-# ── Agent 5 : Orchestrateur ──────────────────────────────────────────────────
 orchestrator_agent = Agent(
     role="Orchestrateur de Pipeline Multi-Agents",
     goal=(
-        "Coordonner l'ensemble des 5 agents spécialisés, "
-        "gérer les priorités en temps réel, décider des escalades "
-        "et garantir la cohérence globale de l'analyse."
+        "Coordonner les 5 agents, gérer les priorités et garantir "
+        "la cohérence globale de l'analyse."
     ),
     backstory=(
         "Tu es le chef d'orchestre du système de supervision. "
-        "Tu supervises en permanence l'état global du pipeline, "
-        "coordonnes les interventions des agents selon la criticité des événements, "
-        "gères les conflits de priorité et garantis que chaque anomalie "
-        "est traitée dans le bon ordre par le bon agent. "
-        "En cas d'incident critique, tu escalades immédiatement vers "
-        "le détecteur et le correcteur avant tout autre traitement. "
         "Tu réponds DIRECTEMENT sans utiliser d'outil externe."
     ),
-    tools=[],   # Aucun outil : répond directement — évite brave_search sur Groq
+    tools=[],
     llm=llm,
     verbose=True
 )
 
-# ── Agent 6 : Rapporteur ─────────────────────────────────────────────────────
 reporter_agent = Agent(
     role="Rapporteur et Synthétiseur",
     goal=(
-        "Générer un rapport complet, structuré et lisible "
-        "consolidant les résultats de tous les agents, "
-        "puis le sauvegarder sur S3 pour les équipes opérationnelles."
+        "Générer un rapport complet consolidant les résultats "
+        "de tous les agents et le sauvegarder sur S3."
     ),
     backstory=(
-        "Tu es expert en reporting opérationnel et visualisation de données. "
-        "Tu synthétises les analyses, anomalies, alarmes et actions correctives "
-        "en rapports clairs avec des KPIs précis, des recommandations "
-        "et un résumé exécutif pour les équipes de supervision."
+        "Tu es expert en reporting opérationnel. "
+        "Tu synthétises analyses, anomalies, alarmes et actions en rapports clairs."
     ),
     tools=[outil_rapport],
     llm=llm,

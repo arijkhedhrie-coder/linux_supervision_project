@@ -63,13 +63,15 @@ from src.agents.agents import (
     orchestrator_agent,
     reporter_agent,
 )
+
+# ── Import tasks — tache_correction est maintenant dynamique ──
 from src.agents.tasks import (
     tache_collecte,
     tache_analyse,
     tache_detection,
-    tache_correction,
     tache_orchestration,
     tache_rapport,
+    creer_tache_correction,   # ← fonction dynamique au lieu de tache_correction statique
 )
 
 
@@ -107,12 +109,8 @@ for obj in objets:
     try:
         resp = s3.get_object(Bucket=BUCKET, Key=key)
         df_tmp = pd.read_csv(io.BytesIO(resp["Body"].read()))
-
-        # Extraire le nom du serveur depuis le nom du fichier
-        # ex: processed/dataset_2026-03-10_06-32.csv → server_2026-03-10_06-32
         nom_fichier = key.split("/")[-1].replace("dataset_", "").replace(".csv", "")
         df_tmp["Serveur"] = f"server_{nom_fichier}"
-
         frames.append(df_tmp)
         print(f"      [OK] {len(df_tmp)} lignes chargées")
     except Exception as e:
@@ -122,18 +120,12 @@ if not frames:
     print("[ERREUR] Impossible de charger les datasets S3")
     sys.exit(1)
 
-# Combiner tous les datasets réels
 df_multi_raw = pd.concat(frames, ignore_index=True)
 print(f"\n[DATA] {len(df_multi_raw)} lignes réelles chargées depuis {len(frames)} dataset(s)")
 
-# Les datasets S3 sont déjà transformés — normaliser les colonnes directement
 df_multi = df_multi_raw.copy()
 
-# ── MAPPING des colonnes S3 → colonnes attendues par le pipeline ──────────────
-# Colonnes S3 réelles : timestamp, source_ip, type_event, statut, detail, source_log, severite
-# Colonnes attendues  : Date, IP_Source, Etat, Service, Message
-
-# 1. Date
+# ── MAPPING des colonnes S3 ──
 if "Date" not in df_multi.columns:
     if "timestamp" in df_multi.columns:
         df_multi["Date"] = pd.to_datetime(df_multi["timestamp"], errors="coerce")
@@ -145,14 +137,12 @@ if "Date" not in df_multi.columns:
 else:
     df_multi["Date"] = pd.to_datetime(df_multi["Date"], errors="coerce")
 
-# 2. IP_Source
 if "IP_Source" not in df_multi.columns:
     if "source_ip" in df_multi.columns:
         df_multi["IP_Source"] = df_multi["source_ip"]
     else:
         df_multi["IP_Source"] = None
 
-# 3. Etat (Error / Warning / Info) — mappé depuis statut ou severite
 if "Etat" not in df_multi.columns:
     if "statut" in df_multi.columns:
         def mapper_etat(val):
@@ -175,7 +165,6 @@ if "Etat" not in df_multi.columns:
     else:
         df_multi["Etat"] = "Info"
 
-# 4. Service — mappé depuis source_log ou type_event
 if "Service" not in df_multi.columns:
     if "source_log" in df_multi.columns:
         df_multi["Service"] = df_multi["source_log"]
@@ -184,14 +173,12 @@ if "Service" not in df_multi.columns:
     else:
         df_multi["Service"] = "unknown"
 
-# 5. Message — mappé depuis detail
 if "Message" not in df_multi.columns:
     if "detail" in df_multi.columns:
         df_multi["Message"] = df_multi["detail"]
     else:
         df_multi["Message"] = ""
 
-# Supprimer les lignes sans date valide
 avant = len(df_multi)
 df_multi = df_multi.dropna(subset=["Date"])
 if len(df_multi) < avant:
@@ -203,15 +190,18 @@ print(f"[DATA] Etat distribution : {df_multi['Etat'].value_counts().to_dict()}")
 nb_serveurs = df_multi["Serveur"].nunique()
 print(f"[DATA] {len(df_multi)} lignes nettoyées | {nb_serveurs} source(s) de logs distincte(s)")
 
-# Métriques
+# ══════════════════════════════════════════════════════════════════════════════
+# ÉTAPE 2 — DÉTECTION D'ANOMALIES
+# ══════════════════════════════════════════════════════════════════════════════
 erreurs_par_heure, tentatives_par_ip, events_par_service = calculer_metriques(df_multi)
 
+df_par_ip = df_multi.groupby("IP_Source").agg(
+    Nombre_Tentatives=("Etat", lambda x: (x == "Error").sum()),
+    Date=("Date", "first"),
+).reset_index()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 2 — DÉTECTION D'ANOMALIES + ALARMES PRÉVENTIVES
-# ══════════════════════════════════════════════════════════════════════════════
-print("\n[DÉTECTION] Analyse des anomalies en cours...")
-tentatives_par_ip, anomalies, alarmes = detecter_anomalies(tentatives_par_ip)
+# Détecter sur ce DataFrame
+df_par_ip, anomalies, alarmes = detecter_anomalies(df_par_ip)
 
 if alarmes:
     print(f"\n🚨 {len(alarmes)} ALARME(S) PRÉVENTIVE(S) DÉCLENCHÉE(S) :")
@@ -238,23 +228,16 @@ print("\n[OK] Pipeline de données terminé avec succès")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ÉTAPE 5 — CONTEXTE COMPACT POUR LES AGENTS (limite Groq : 6000 tokens)
+# ÉTAPE 5 — CONTEXTE COMPACT POUR LES AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Garder seulement les 5 alarmes les plus critiques
 alarmes_critiques = [a for a in alarmes if a.get("severite") == "CRITIQUE"][:5]
 alarmes_resume = [
     {"ip": a["ip"], "type": a["type"], "valeur": a["valeur"], "severite": a["severite"]}
     for a in alarmes_critiques
 ]
 
-# Top 3 anomalies ML uniquement
-top_anomalies = anomalies.head(3)[["IP_Source", "Nombre_Tentatives", "anomalie_score"]].to_string() \
-    if len(anomalies) > 0 else "Aucune"
-
-# Liste des sources de logs réelles
 sources_logs = df_multi["Serveur"].unique().tolist()
-sources_str = ",".join(sources_logs)
+sources_str  = ",".join(sources_logs)
 
 contexte_pipeline = (
     f"SUPERVISION {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
@@ -262,32 +245,24 @@ contexte_pipeline = (
     f"Anomalies ML: {len(anomalies)} | Alarmes: {len(alarmes)}"
 )
 
-# Résumé ultra-court pour les tâches (≈ 80 tokens max)
 def _resumer_alarmes(alarmes_list, anomalies_df):
-    """Crée un résumé en une ligne des alarmes pour économiser les tokens."""
     if not alarmes_list:
         return "Aucune alarme critique"
-    parties = []
-    for a in alarmes_list[:3]:   # max 3 IPs
-        parties.append(f"{a['ip']}({int(a['valeur'])} tentatives)")
-    resume = ", ".join(parties)
+    parties = [f"{a['ip']}({int(a['valeur'])} tentatives)" for a in alarmes_list[:3]]
+    resume  = ", ".join(parties)
     if len(anomalies_df) > 3:
         resume += f" — {len(anomalies_df)} anomalies au total"
     return resume
 
-alarmes_resumees = _resumer_alarmes(alarmes_critiques, anomalies)
-
-# IP principale = l'attaquant le plus actif (première alarme critique)
-ip_principale = alarmes_critiques[0]["ip"] if alarmes_critiques else "N/A"
-
-# JSON compact pour les rares cas où le JSON complet est nécessaire
+alarmes_resumees    = _resumer_alarmes(alarmes_critiques, anomalies)
+ip_principale       = alarmes_critiques[0]["ip"] if alarmes_critiques else "N/A"
 alarmes_json_compact = json.dumps(alarmes_resume, ensure_ascii=False)
 
 print("\n" + "="*60)
 print("   DÉMARRAGE DES 6 AGENTS IA CREWAI")
 print("="*60)
-print(f"[TOKEN GUARD] Contexte : {len(contexte_pipeline)} chars | "
-      f"Alarmes envoyées : {len(alarmes_critiques)}/{len(alarmes)}")
+print(f"[TOKEN GUARD] Contexte       : {len(contexte_pipeline)} chars")
+print(f"[TOKEN GUARD] Alarmes        : {len(alarmes_critiques)}/{len(alarmes)}")
 print(f"[TOKEN GUARD] Résumé alarmes : {alarmes_resumees}")
 print(f"[TOKEN GUARD] IP principale  : {ip_principale}")
 print(f"[TOKEN GUARD] Sources logs   : {sources_str}")
@@ -297,24 +272,35 @@ print(f"[TOKEN GUARD] Sources logs   : {sources_str}")
 # ÉTAPE 6 — ORCHESTRATION DES 6 AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# THROTTLE GROQ : 20s entre chaque appel LLM
+# ── Créer la tâche correction DYNAMIQUE selon ip_principale ──
+tache_correction_dynamique = creer_tache_correction(
+    ip_principale=ip_principale,
+    nb_anomalies=len(anomalies)
+)
+
+if ip_principale not in ("N/A", "multiple", "", "nan", "none", "None"):
+    print(f"[CORRECTION] Mode BLOCAGE ACTIF → IP cible : {ip_principale}")
+else:
+    print(f"[CORRECTION] Mode SURVEILLANCE NORMALE → pas d'IP à bloquer")
+
+# ── Throttle Groq ──
 from src.agents.agents import llm as groq_llm
 _last_llm_call_time = [0.0]
 
 def _throttled_call(self, *args, **kwargs):
     elapsed = time.time() - _last_llm_call_time[0]
-    wait = 20.0 - elapsed
+    wait    = 20.0 - elapsed
     if wait > 0:
         print(f"[THROTTLE] Attente {wait:.1f}s avant prochain appel LLM...")
         time.sleep(wait)
     _last_llm_call_time[0] = time.time()
-    for tentative in range(3):  # 3 essais max
+    for tentative in range(3):
         try:
             return _original_call(self, *args, **kwargs)
         except Exception as e:
-            if "SSL" in str(e) or "ConnectError" in str(e):
-                print(f"[RETRY] Erreur réseau ({tentative+1}/3) — attente 15s...")
-                time.sleep(15)
+            if "SSL" in str(e) or "ConnectError" in str(e) or "10054" in str(e):
+                print(f"[RETRY] Erreur réseau ({tentative+1}/3) — attente 10s...")
+                time.sleep(10)
             else:
                 raise
     raise RuntimeError("Echec après 3 tentatives réseau")
@@ -336,7 +322,7 @@ crew = Crew(
         tache_collecte,
         tache_analyse,
         tache_detection,
-        tache_correction,
+        tache_correction_dynamique,   # ← dynamique
         tache_rapport,
     ],
     process=Process.sequential,
@@ -346,13 +332,13 @@ crew = Crew(
 
 resultat = crew.kickoff(
     inputs={
-        "serveur_nom":        sources_str,             # ← noms réels des sources
-        "date":               datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "contexte_pipeline":  contexte_pipeline,
-        "alarmes_json":       alarmes_json_compact,
-        "alarmes_resumees":   alarmes_resumees,
-        "ip_principale":      ip_principale,
-        "nb_anomalies":       str(len(anomalies)),
+        "serveur_nom":       sources_str,
+        "date":              datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "contexte_pipeline": contexte_pipeline,
+        "alarmes_json":      alarmes_json_compact,
+        "alarmes_resumees":  alarmes_resumees,
+        "ip_principale":     ip_principale,
+        "nb_anomalies":      str(len(anomalies)),
     }
 )
 
